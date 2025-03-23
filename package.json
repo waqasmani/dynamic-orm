@@ -1,0 +1,46 @@
+{
+  "name": "dynamic-orm",
+  "version": "1.0.0",
+  "description": "A flexible and powerful dynamic ORM for SQL databases with Redis caching support",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "bin": {
+    "dynamic-orm-init": "scripts/init.js"
+  },
+  "files": [
+    "dist",
+    "scripts",
+    "README.md",
+    "SUMMARY.md",
+    "migration-guide.md"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "test": "jest",
+    "prepublishOnly": "npm run build",
+    "init": "node scripts/init.js"
+  },
+  "keywords": [
+    "orm",
+    "database",
+    "sql",
+    "redis",
+    "caching",
+    "dynamic"
+  ],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "uuid": "^9.0.0"
+  },
+  "peerDependencies": {
+    "redis": "^4.0.0"
+  },
+  "devDependencies": {
+    "@types/jest": "^29.5.0",
+    "@types/node": "^18.15.11",
+    "@types/uuid": "^9.0.1",
+    "jest": "^29.5.0",
+    "typescript": "^5.0.4"
+  }
+} 
