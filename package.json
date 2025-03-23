@@ -28,7 +28,7 @@
     "caching",
     "dynamic"
   ],
-  "author": "",
+  "author": "DynamicORM Team",
   "license": "MIT",
   "dependencies": {
     "uuid": "^9.0.0"

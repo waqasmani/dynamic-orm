@@ -462,83 +462,157 @@ export class DynamicModel {
    * @private
    */
   private _processRelatedData(rawData: any[], relations: Relation[]): any[] {
-    if (!rawData || !rawData.length) return [];
+    const result = [...rawData];
     
-    const result: any[] = [];
-    const primaryKeyField = this.primaryKey;
-    const processedIds = new Set<string | number>();
-    
-    for (const row of rawData) {
-      const id = row[primaryKeyField];
+    // Process each record
+    for (let i = 0; i < result.length; i++) {
+      const record = result[i];
       
-      // Skip if we already processed this main record
-      if (processedIds.has(id)) continue;
-      processedIds.add(id);
-      
-      // Create the main record (exclude relation fields)
-      const mainRecord = { ...row };
+      // Skip processing if null or undefined
+      if (!record) continue;
       
       // Process each relation
-      for (const relation of relations) {
+      relations.forEach(relation => {
         const as = relation.as || relation.table;
         
-        // Initialize relation container
-        mainRecord[as] = relation.type === 'many' ? [] : {};
+        // Initialize relation objects on the record
+        if (relation.type === 'many') {
+          record[as] = [];
+        } else {
+          record[as] = {};
+        }
+      });
+    }
+    
+    // Dictionary to keep track of relations for each record
+    const relationData: Record<string, Record<string, Record<string, any>>> = {};
+    
+    // Process each record
+    for (let i = 0; i < rawData.length; i++) {
+      const row = rawData[i];
+      
+      // Skip processing if null or undefined
+      if (!row) continue;
+      
+      const recordId = row[this.primaryKey];
+      if (!recordId) continue;
+      
+      // Initialize record in relation data dictionary
+      if (!relationData[recordId]) {
+        relationData[recordId] = {};
+      }
+      
+      // Process each relation
+      relations.forEach(relation => {
+        const as = relation.as || relation.table;
         
-        // Extract relation fields from the row
-        if (relation.select && Array.isArray(relation.select)) {
-          const relObject = relation.type === 'many' ? [] : {};
-          let hasRelatedData = false;
-          
-          for (const field of relation.select) {
-            const relFieldKey = `${as}.${field}`;
+        // Initialize relation in record if not exists
+        if (!relationData[recordId][as]) {
+          relationData[recordId][as] = relation.type === 'many' ? [] : {};
+        }
+        
+        // Get relation object for this record
+        const relObject = relationData[recordId][as];
+        let hasRelatedData = false;
+        
+        // Process each relation field
+        const relFields = relation.select || '*';
+        if (relFields === '*') {
+          // Handle all fields
+          Object.keys(row).forEach(key => {
+            // If the key starts with the relation prefix
+            const prefix = `${as}.`;
+            if (key.startsWith(prefix)) {
+              const field = key.substring(prefix.length);
+              
+              // If the relation field exists in the result
+              if (key in row) {
+                // Add the field to the relation object
+                if (relation.type === 'many') {
+                  // Handle many relation case - initialize array with object if empty
+                  const relArray = relObject as any[];
+                  if (relArray.length === 0) {
+                    relArray.push({});
+                  }
+                  relArray[0][field] = row[key];
+                } else {
+                  // Handle single relation case
+                  (relObject as any)[field] = row[key];
+                }
+                
+                // Mark that we found related data
+                hasRelatedData = true;
+              }
+            }
+          });
+        } else {
+          // Handle specific relation fields
+          if (Array.isArray(relFields)) {
+            relFields.forEach(field => {
+              const relFieldKey = `${as}.${field}`;
+              
+              // If the relation field exists in the result
+              if (relFieldKey in row) {
+                // Add the field to the relation object
+                if (relation.type === 'many') {
+                  // Handle many relation case - initialize array with object if empty
+                  const relArray = relObject as any[];
+                  if (relArray.length === 0) {
+                    relArray.push({});
+                  }
+                  relArray[0][field] = row[relFieldKey];
+                } else {
+                  // Handle single relation case
+                  (relObject as any)[field] = row[relFieldKey];
+                }
+                
+                // Mark that we found related data
+                hasRelatedData = true;
+              }
+            });
+          } else if (typeof relFields === 'string') {
+            const relFieldKey = `${as}.${relFields}`;
             
             // If the relation field exists in the result
             if (relFieldKey in row) {
               // Add the field to the relation object
               if (relation.type === 'many') {
-                // Handle many relation case
-                if (!relObject[0]) relObject[0] = {};
-                relObject[0][field] = row[relFieldKey];
+                // Handle many relation case - initialize array with object if empty
+                const relArray = relObject as any[];
+                if (relArray.length === 0) {
+                  relArray.push({});
+                }
+                relArray[0][relFields] = row[relFieldKey];
               } else {
                 // Handle single relation case
-                (relObject as any)[field] = row[relFieldKey];
+                (relObject as any)[relFields] = row[relFieldKey];
               }
               
               // Mark that we found related data
               hasRelatedData = true;
-              
-              // Remove the dotted field from the main record
-              delete mainRecord[relFieldKey];
             }
           }
-          
-          // Only set if we actually found related data
-          if (hasRelatedData) {
-            if (relation.type === 'many') {
-              mainRecord[as] = relObject;
-            } else {
-              // If relation has only a single field, extract the value directly
-              if ((relation.select as string[]).length === 1) {
-                const singleField = relation.select[0];
-                mainRecord[as] = (relObject as any)[singleField];
-              } else {
-                mainRecord[as] = relObject;
-              }
-            }
+        }
+        
+        // Only set if we actually found related data
+        if (hasRelatedData) {
+          if (relation.type === 'many') {
+            relationData[recordId][as] = relObject;
           } else {
-            // If no relation data was found, set to null for single relations
-            // or empty array for many relations
-            mainRecord[as] = relation.type === 'many' ? [] : null;
+            // If relation has only a single field, extract the value directly
+            if (relation.select && Array.isArray(relation.select) && relation.select.length === 1) {
+              const singleField = relation.select[0];
+              relationData[recordId][as] = (relObject as any)[singleField];
+            } else {
+              relationData[recordId][as] = relObject;
+            }
           }
         } else {
-          // If no relation fields were selected, set to null for single relations
+          // If no relation data was found, set to null for single relations
           // or empty array for many relations
-          mainRecord[as] = relation.type === 'many' ? [] : null;
+          relationData[recordId][as] = relation.type === 'many' ? [] : {};
         }
-      }
-      
-      result.push(mainRecord);
+      });
     }
     
     return result;
@@ -915,7 +989,7 @@ export class DynamicModel {
    * Build field selection clause
    * @private
    */
-  private _buildSelectClause(fields?: string[] | string): string {
+  private _buildSelectClause(fields?: string[] | string | null): string {
     if (!fields || (Array.isArray(fields) && fields.length === 0)) {
       return '*';
     }
