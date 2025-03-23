@@ -1,4 +1,4 @@
-import { DynamicModelOptions, Filters, QueryOptions, QueryResult, CacheAdapter, DatabaseAdapter } from './types';
+import { DynamicModelOptions, Filters, QueryOptions, QueryResult, Relation, CacheAdapter, DatabaseAdapter } from './types';
 /**
  * Enhanced Dynamic Model for database operations
  * Provides a flexible and powerful abstraction over database tables
@@ -13,6 +13,7 @@ export declare class DynamicModel {
     private searchableFields;
     private db;
     private cache;
+    private logger;
     /**
      * Create a new Dynamic Model instance
      * @param table - Database table name
@@ -30,7 +31,7 @@ export declare class DynamicModel {
      * Process query results to organize related data
      * @private
      */
-    private _processRelatedData;
+    _processRelatedData(records: any[], relations: Relation[]): Promise<any[]>;
     /**
      * Find a record by its primary key
      */

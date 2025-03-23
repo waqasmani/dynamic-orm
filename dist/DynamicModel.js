@@ -2,6 +2,13 @@
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.DynamicModel = void 0;
 const uuid_1 = require("uuid");
+// Default logger that uses console
+const defaultLogger = {
+    error: (message, ...args) => console.error(message, ...args),
+    warn: (message, ...args) => console.warn(message, ...args),
+    info: (message, ...args) => console.info(message, ...args),
+    debug: (message, ...args) => console.debug(message, ...args)
+};
 /**
  * Enhanced Dynamic Model for database operations
  * Provides a flexible and powerful abstraction over database tables
@@ -24,6 +31,7 @@ class DynamicModel {
         this.searchableFields = options.searchableFields || [];
         this.db = db;
         this.cache = cache;
+        this.logger = options.logger || defaultLogger;
     }
     /**
      * Find records with filtering, pagination, sorting and field selection
@@ -44,10 +52,18 @@ class DynamicModel {
         // Build cache key
         const cacheKey = this._buildCacheKey('findAll', { filters, sort, fields, pagination, search, relations });
         // Try to get from cache
+        let cached = null;
         if (this.useCache) {
-            const cached = await this.cache.get(cacheKey);
-            if (cached) {
-                return JSON.parse(cached);
+            try {
+                cached = await this.cache.get(cacheKey);
+                if (cached) {
+                    return JSON.parse(cached);
+                }
+            }
+            catch (cacheError) {
+                // Log cache error but continue without cache
+                this.logger.error(`[${this.table}] Cache error in findAll:`, cacheError);
+                // Continue execution without using cache
             }
         }
         try {
@@ -402,7 +418,7 @@ class DynamicModel {
             let data = rawData;
             if (relations && Array.isArray(relations) && relations.length > 0) {
                 // Group related data into nested objects
-                data = this._processRelatedData(rawData, relations);
+                data = await this._processRelatedData(rawData, relations);
             }
             // Build result
             const result = {
@@ -415,14 +431,20 @@ class DynamicModel {
                     hasNext: limit ? (offset + limit < total) : false
                 }
             };
-            // Cache result
+            // Cache the result
             if (this.useCache) {
-                await this.cache.set(cacheKey, JSON.stringify(result), 'EX', this.cacheTTL);
+                try {
+                    await this.cache.set(cacheKey, JSON.stringify(result), 'EX', this.cacheTTL);
+                }
+                catch (cacheError) {
+                    // Just log cache error but continue
+                    this.logger.error(`[${this.table}] Cache error during set in findAll:`, cacheError);
+                }
             }
             return result;
         }
         catch (error) {
-            console.error(`[${this.table}] findAll error:`, error);
+            this.logger.error(`[${this.table}] findAll error:`, error);
             throw error;
         }
     }
@@ -434,150 +456,112 @@ class DynamicModel {
      * Process query results to organize related data
      * @private
      */
-    _processRelatedData(rawData, relations) {
-        const result = [...rawData];
-        // Process each record
-        for (let i = 0; i < result.length; i++) {
-            const record = result[i];
-            // Skip processing if null or undefined
-            if (!record)
-                continue;
-            // Process each relation
-            relations.forEach(relation => {
-                const as = relation.as || relation.table;
-                // Initialize relation objects on the record
-                if (relation.type === 'many') {
-                    record[as] = [];
-                }
-                else {
-                    record[as] = {};
-                }
-            });
+    async _processRelatedData(records, relations) {
+        if (!records || records.length === 0 || !relations || relations.length === 0) {
+            return records;
         }
-        // Dictionary to keep track of relations for each record
+        const result = [...records];
         const relationData = {};
-        // Process each record
-        for (let i = 0; i < rawData.length; i++) {
-            const row = rawData[i];
-            // Skip processing if null or undefined
-            if (!row)
-                continue;
-            const recordId = row[this.primaryKey];
-            if (!recordId)
-                continue;
-            // Initialize record in relation data dictionary
-            if (!relationData[recordId]) {
-                relationData[recordId] = {};
+        // Initialize relation data structure for each record
+        for (const record of result) {
+            if (record && record[this.primaryKey] !== undefined && record[this.primaryKey] !== null) {
+                relationData[record[this.primaryKey]] = {};
             }
-            // Process each relation
-            relations.forEach(relation => {
-                const as = relation.as || relation.table;
-                // Initialize relation in record if not exists
-                if (!relationData[recordId][as]) {
-                    relationData[recordId][as] = relation.type === 'many' ? [] : {};
-                }
-                // Get relation object for this record
-                const relObject = relationData[recordId][as];
-                let hasRelatedData = false;
-                // Process each relation field
-                const relFields = relation.select || '*';
-                if (relFields === '*') {
-                    // Handle all fields
-                    Object.keys(row).forEach(key => {
-                        // If the key starts with the relation prefix
-                        const prefix = `${as}.`;
-                        if (key.startsWith(prefix)) {
-                            const field = key.substring(prefix.length);
-                            // If the relation field exists in the result
-                            if (key in row) {
-                                // Add the field to the relation object
-                                if (relation.type === 'many') {
-                                    // Handle many relation case - initialize array with object if empty
-                                    const relArray = relObject;
-                                    if (relArray.length === 0) {
-                                        relArray.push({});
-                                    }
-                                    relArray[0][field] = row[key];
-                                }
-                                else {
-                                    // Handle single relation case
-                                    relObject[field] = row[key];
-                                }
-                                // Mark that we found related data
-                                hasRelatedData = true;
-                            }
+        }
+        // Process each relation
+        for (const relation of relations) {
+            const table = relation.table;
+            const foreignKey = relation.foreignKey;
+            const as = relation.as || table;
+            const type = relation.type || 'one';
+            const select = relation.select;
+            // Collect all record IDs (skipping nulls)
+            const recordIds = result
+                .filter(r => r && r[this.primaryKey] !== undefined && r[this.primaryKey] !== null)
+                .map(r => r[this.primaryKey]);
+            if (recordIds.length === 0) {
+                continue; // Skip if there are no valid record IDs
+            }
+            // Build SQL query to fetch related data
+            const selectClause = this._buildSelectClause(select);
+            const query = `SELECT ${selectClause} FROM ${table} WHERE ${foreignKey} IN (${recordIds.map(() => '?').join(',')})`;
+            try {
+                // Fetch related data
+                const relatedResults = await this.db.prepare(query, recordIds);
+                // Process results
+                for (const row of relatedResults) {
+                    const recordId = row[foreignKey];
+                    if (recordId && relationData[recordId]) {
+                        // Initialize relation container if needed
+                        if (!relationData[recordId][as]) {
+                            relationData[recordId][as] = type === 'many' ? [] : {};
                         }
-                    });
-                }
-                else {
-                    // Handle specific relation fields
-                    if (Array.isArray(relFields)) {
-                        relFields.forEach(field => {
-                            const relFieldKey = `${as}.${field}`;
-                            // If the relation field exists in the result
-                            if (relFieldKey in row) {
-                                // Add the field to the relation object
-                                if (relation.type === 'many') {
-                                    // Handle many relation case - initialize array with object if empty
-                                    const relArray = relObject;
-                                    if (relArray.length === 0) {
-                                        relArray.push({});
-                                    }
-                                    relArray[0][field] = row[relFieldKey];
-                                }
-                                else {
-                                    // Handle single relation case
-                                    relObject[field] = row[relFieldKey];
-                                }
-                                // Mark that we found related data
-                                hasRelatedData = true;
-                            }
-                        });
-                    }
-                    else if (typeof relFields === 'string') {
-                        const relFieldKey = `${as}.${relFields}`;
-                        // If the relation field exists in the result
-                        if (relFieldKey in row) {
-                            // Add the field to the relation object
-                            if (relation.type === 'many') {
-                                // Handle many relation case - initialize array with object if empty
-                                const relArray = relObject;
-                                if (relArray.length === 0) {
-                                    relArray.push({});
-                                }
-                                relArray[0][relFields] = row[relFieldKey];
-                            }
-                            else {
-                                // Handle single relation case
-                                relObject[relFields] = row[relFieldKey];
-                            }
-                            // Mark that we found related data
-                            hasRelatedData = true;
-                        }
-                    }
-                }
-                // Only set if we actually found related data
-                if (hasRelatedData) {
-                    if (relation.type === 'many') {
-                        relationData[recordId][as] = relObject;
-                    }
-                    else {
-                        // If relation has only a single field, extract the value directly
-                        if (relation.select && Array.isArray(relation.select) && relation.select.length === 1) {
-                            const singleField = relation.select[0];
-                            relationData[recordId][as] = relObject[singleField];
+                        // Add related data
+                        if (type === 'many') {
+                            relationData[recordId][as].push(row);
                         }
                         else {
-                            relationData[recordId][as] = relObject;
+                            // For single relations, build the object
+                            let hasRelatedData = false;
+                            const relObject = {};
+                            // Process row data based on select fields or all fields
+                            if (select) {
+                                for (const field of Array.isArray(select) ? select : select.split(',')) {
+                                    const relFieldKey = field.trim();
+                                    if (row[relFieldKey] !== undefined) {
+                                        relObject[relFieldKey] = row[relFieldKey];
+                                        hasRelatedData = true;
+                                    }
+                                }
+                                // Always include the foreignKey for single relation
+                                if (row[foreignKey] !== undefined) {
+                                    relObject[foreignKey] = row[foreignKey];
+                                }
+                            }
+                            else {
+                                // Include all fields, including the foreign key
+                                for (const relFieldKey in row) {
+                                    relObject[relFieldKey] = row[relFieldKey];
+                                    hasRelatedData = true;
+                                }
+                            }
+                            // Only set if we actually found related data
+                            if (hasRelatedData) {
+                                // Extract single field if relation has only one select field
+                                if (select && Array.isArray(select) && select.length === 1) {
+                                    const singleField = select[0];
+                                    relationData[recordId][as] = row[singleField]; // Use direct row value instead of relObject
+                                }
+                                else {
+                                    relationData[recordId][as] = relObject;
+                                }
+                            }
+                            else {
+                                // If no relation data was found, set to empty object for single relations
+                                relationData[recordId][as] = {};
+                            }
                         }
                     }
                 }
-                else {
-                    // If no relation data was found, set to null for single relations
-                    // or empty array for many relations
-                    relationData[recordId][as] = relation.type === 'many' ? [] : {};
+                // Apply default empty values for records with no related data
+                for (const recordId of recordIds) {
+                    if (relationData[recordId] && !relationData[recordId][as]) {
+                        relationData[recordId][as] = type === 'many' ? [] : {};
+                    }
                 }
-            });
+            }
+            catch (error) {
+                this.logger.error(`[${this.table}] Error fetching related data for ${table}:`, error);
+            }
+        }
+        // Merge relation data with records
+        for (const record of result) {
+            if (record && record[this.primaryKey] !== undefined && record[this.primaryKey] !== null) {
+                const recordId = record[this.primaryKey];
+                if (relationData[recordId]) {
+                    Object.assign(record, relationData[recordId]);
+                }
+            }
         }
         return result;
     }
@@ -589,10 +573,18 @@ class DynamicModel {
             return null;
         const cacheKey = this._buildCacheKey('findById', { id, fields });
         // Try to get from cache
+        let cached = null;
         if (this.useCache) {
-            const cached = await this.cache.get(cacheKey);
-            if (cached) {
-                return JSON.parse(cached);
+            try {
+                cached = await this.cache.get(cacheKey);
+                if (cached) {
+                    return JSON.parse(cached);
+                }
+            }
+            catch (cacheError) {
+                // Log cache error but continue without cache
+                this.logger.error(`[${this.table}] Cache error in findById:`, cacheError);
+                // Continue execution without using cache
             }
         }
         try {
@@ -602,12 +594,18 @@ class DynamicModel {
             const record = results.length > 0 ? results[0] : null;
             // Cache result
             if (this.useCache && record) {
-                await this.cache.set(cacheKey, JSON.stringify(record), 'EX', this.cacheTTL);
+                try {
+                    await this.cache.set(cacheKey, JSON.stringify(record), 'EX', this.cacheTTL);
+                }
+                catch (cacheError) {
+                    // Just log cache error but continue
+                    this.logger.error(`[${this.table}] Cache error during set in findById:`, cacheError);
+                }
             }
             return record;
         }
         catch (error) {
-            console.error(`[${this.table}] findById error:`, error);
+            this.logger.error(`[${this.table}] findById error:`, error);
             throw error;
         }
     }
@@ -615,14 +613,17 @@ class DynamicModel {
      * Find a record by a specific field value
      */
     async findByField(field, value, fields) {
-        if (!field)
-            return null;
+        let cached = null;
         const cacheKey = this._buildCacheKey('findByField', { field, value, fields });
-        // Try to get from cache
         if (this.useCache) {
-            const cached = await this.cache.get(cacheKey);
-            if (cached) {
-                return JSON.parse(cached);
+            try {
+                cached = await this.cache.get(cacheKey);
+                if (cached) {
+                    return JSON.parse(cached);
+                }
+            }
+            catch (error) {
+                this.logger.error(`[${this.table}] Cache error when getting in findByField:`, error);
             }
         }
         try {
@@ -632,12 +633,17 @@ class DynamicModel {
             const record = results.length > 0 ? results[0] : null;
             // Cache result
             if (this.useCache && record) {
-                await this.cache.set(cacheKey, JSON.stringify(record), 'EX', this.cacheTTL);
+                try {
+                    await this.cache.set(cacheKey, JSON.stringify(record), 'EX', this.cacheTTL);
+                }
+                catch (error) {
+                    this.logger.error(`[${this.table}] Cache error when setting in findByField:`, error);
+                }
             }
             return record;
         }
         catch (error) {
-            console.error(`[${this.table}] findByField error:`, error);
+            this.logger.error(`[${this.table}] findByField error:`, error);
             throw error;
         }
     }
@@ -661,14 +667,16 @@ class DynamicModel {
                 query += ` RETURNING *`;
             }
             const result = await this.db.prepare(query, values);
+            // Store the return value before trying to invalidate cache
+            const returnValue = returnRecord ? result[0] : result;
             // Invalidate cache
             if (this.useCache) {
                 await this.invalidateTableCache();
             }
-            return returnRecord ? result[0] : result;
+            return returnValue;
         }
         catch (error) {
-            console.error(`[${this.table}] create error:`, error);
+            this.logger.error(`[${this.table}] create error:`, error);
             throw error;
         }
     }
@@ -691,15 +699,21 @@ class DynamicModel {
             const result = await this.db.prepare(query, [...Object.values(data), id]);
             // Invalidate cache
             if (this.useCache) {
-                await Promise.all([
-                    this.cache.del(this._buildCacheKey('findById', { id })),
-                    this.invalidateTableCache()
-                ]);
+                try {
+                    await Promise.all([
+                        this.cache.del(this._buildCacheKey('findById', { id })),
+                        this.invalidateTableCache()
+                    ]);
+                }
+                catch (cacheError) {
+                    // Just log cache error but continue
+                    this.logger.error(`[${this.table}] Cache error during invalidation in update:`, cacheError);
+                }
             }
             return returnRecord ? (result.length > 0 ? result[0] : null) : result;
         }
         catch (error) {
-            console.error(`[${this.table}] update error:`, error);
+            this.logger.error(`[${this.table}] update error:`, error);
             throw error;
         }
     }
@@ -722,15 +736,21 @@ class DynamicModel {
             const result = await this.db.prepare(query, [id]);
             // Invalidate cache
             if (this.useCache) {
-                await Promise.all([
-                    this.cache.del(this._buildCacheKey('findById', { id })),
-                    this.invalidateTableCache()
-                ]);
+                try {
+                    await Promise.all([
+                        this.cache.del(this._buildCacheKey('findById', { id })),
+                        this.invalidateTableCache()
+                    ]);
+                }
+                catch (cacheError) {
+                    // Just log cache error but continue
+                    this.logger.error(`[${this.table}] Cache error during invalidation in delete:`, cacheError);
+                }
             }
             return returnRecord ? deletedRecord : result;
         }
         catch (error) {
-            console.error(`[${this.table}] delete error:`, error);
+            this.logger.error(`[${this.table}] delete error:`, error);
             throw error;
         }
     }
@@ -740,10 +760,18 @@ class DynamicModel {
     async count(filters = {}) {
         const cacheKey = this._buildCacheKey('count', { filters });
         // Try to get from cache
+        let cached = null;
         if (this.useCache) {
-            const cached = await this.cache.get(cacheKey);
-            if (cached) {
-                return parseInt(cached);
+            try {
+                cached = await this.cache.get(cacheKey);
+                if (cached) {
+                    return parseInt(cached);
+                }
+            }
+            catch (cacheError) {
+                // Log cache error but continue without cache
+                this.logger.error(`[${this.table}] Cache error in count:`, cacheError);
+                // Continue execution without using cache
             }
         }
         try {
@@ -803,12 +831,18 @@ class DynamicModel {
             const count = parseInt(result.count);
             // Cache result
             if (this.useCache) {
-                await this.cache.set(cacheKey, count.toString(), 'EX', this.cacheTTL);
+                try {
+                    await this.cache.set(cacheKey, count.toString(), 'EX', this.cacheTTL);
+                }
+                catch (cacheError) {
+                    // Just log cache error but continue
+                    this.logger.error(`[${this.table}] Cache error during set in count:`, cacheError);
+                }
             }
             return count;
         }
         catch (error) {
-            console.error(`[${this.table}] count error:`, error);
+            this.logger.error(`[${this.table}] count error:`, error);
             throw error;
         }
     }
@@ -884,7 +918,7 @@ class DynamicModel {
             return await this.db.prepare(sql, params);
         }
         catch (error) {
-            console.error(`[${this.table}] executeQuery error:`, error);
+            this.logger.error(`[${this.table}] executeQuery error:`, error);
             throw error;
         }
     }
@@ -901,7 +935,7 @@ class DynamicModel {
             }
         }
         catch (error) {
-            console.error(`[${this.table}] invalidateTableCache error:`, error);
+            this.logger.error(`[${this.table}] invalidateTableCache error:`, error);
             // Don't throw as cache invalidation should not break functionality
         }
     }
