@@ -14,6 +14,18 @@ export interface DynamicModelOptions {
   maxLimit?: number;
   /** Fields that can be used for text search */
   searchableFields?: string[];
+  /** Optional custom logger */
+  logger?: Logger;
+}
+
+/**
+ * Logger interface for handling log messages
+ */
+export interface Logger {
+  error(message: string, ...args: any[]): void;
+  warn(message: string, ...args: any[]): void;
+  info(message: string, ...args: any[]): void;
+  debug(message: string, ...args: any[]): void;
 }
 
 /**
